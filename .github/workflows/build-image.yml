@@ -1,0 +1,137 @@
+name: Build custom Bifrost image
+
+on:
+  workflow_dispatch:
+    inputs:
+      bifrost_version:
+        description: Upstream Bifrost gateway (transports) release version, without the v prefix
+        required: false
+        type: string
+  schedule:
+    # Daily: build upstream's newest release if it has no image yet.
+    - cron: "17 6 * * *"
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: plugin/go.mod
+          cache-dependency-path: plugin/go.sum
+
+      - name: Test plugin
+        working-directory: plugin
+        run: |
+          test -z "$(gofmt -l .)" || { gofmt -l .; echo "run gofmt" >&2; exit 1; }
+          go vet ./...
+          go test ./...
+
+  resolve:
+    # Pushes and pull requests only run the tests; images are built on demand or on schedule.
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      build: ${{ steps.resolve.outputs.build }}
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Pick the release to build
+        id: resolve
+        env:
+          REQUESTED: ${{ inputs.bifrost_version }}
+        run: |
+          set -euo pipefail
+          upstream=https://github.com/maximhq/bifrost.git
+          if [[ -n "$REQUESTED" ]]; then
+            version="$REQUESTED"
+            if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then
+              echo "bifrost_version must be a semantic version without a v prefix" >&2
+              exit 1
+            fi
+            git ls-remote --exit-code --refs "$upstream" "refs/tags/transports/v${version}" >/dev/null
+          else
+            # Newest stable gateway release; prereleases are skipped.
+            version=$(git ls-remote --refs --tags "$upstream" 'transports/v*' \
+              | sed -n 's#.*refs/tags/transports/v\([0-9]*\.[0-9]*\.[0-9]*\)$#\1#p' \
+              | sort -V | tail -1)
+            [[ -n "$version" ]] || { echo "no upstream transports/v* release found" >&2; exit 1; }
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+          # A manual run always builds (useful for rebuilding after a plugin change);
+          # a scheduled run skips releases that already have an image.
+          if [[ "$GITHUB_EVENT_NAME" == "schedule" ]] && docker manifest inspect "ghcr.io/pfrybar/bifrost:v${version}" >/dev/null 2>&1; then
+            echo "ghcr.io/pfrybar/bifrost:v${version} already exists; nothing to do"
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "will build v${version}"
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build-and-push:
+    needs: [test, resolve]
+    if: needs.resolve.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    concurrency:
+      group: custom-bifrost-image-${{ needs.resolve.outputs.version }}
+      cancel-in-progress: false
+    env:
+      IMAGE: ghcr.io/pfrybar/bifrost
+      SOURCE_DIR: upstream-bifrost
+      VERSION: ${{ needs.resolve.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out the upstream release and add the plugin
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "transports/v${VERSION}" https://github.com/maximhq/bifrost.git "$SOURCE_DIR"
+          cp -a plugin "$SOURCE_DIR/plugins/mergeleadingsystemmessages"
+
+      - name: Generate a plugin-capable Dockerfile
+        run: python3 scripts/patch-dockerfile.py "$SOURCE_DIR/transports/Dockerfile.local" "$SOURCE_DIR/transports/Dockerfile.custom"
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./${{ env.SOURCE_DIR }}
+          file: ./${{ env.SOURCE_DIR }}/transports/Dockerfile.custom
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            VERSION=${{ env.VERSION }}
+          tags: ${{ env.IMAGE }}:v${{ env.VERSION }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=v${{ env.VERSION }}
+            org.opencontainers.image.title=Bifrost with merge-leading-system-messages plugin
+          cache-from: type=gha,scope=custom-bifrost-${{ env.VERSION }}
+          cache-to: type=gha,mode=max,scope=custom-bifrost-${{ env.VERSION }}
