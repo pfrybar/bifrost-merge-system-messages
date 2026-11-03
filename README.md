@@ -24,8 +24,16 @@ system message are preserved, and system messages later in the conversation are 
 touched (a later one will still trip the Qwen template). `/v1/responses` and
 provider-native request formats are not modified.
 
-The plugin edits only the `messages` field with `gjson`/`sjson`; the rest of the body is
-passed through byte-for-byte.
+The merge runs in two places:
+
+- **`HTTPTransportPreHook`** merges the system messages the client sent, editing only
+  the `messages` field of the raw body with `gjson`/`sjson`.
+- **`PreLLMHook`** merges again after Bifrost core has built the final message list.
+  This is needed because core adds a system message of its own: when an MCP server
+  configured in Bifrost provides `instructions`, Bifrost prepends them as a separate
+  system message (`<mcp_server name="…">…</mcp_server>`) ahead of the client's. That
+  happens after the HTTP hooks run, so only an LLM hook can see it. The merged message
+  keeps Bifrost's MCP instructions first and the client's instructions last.
 
 ## Layout
 
